@@ -20,6 +20,11 @@ import (
 type Producer struct {
 	store    *state.Store
 	interval time.Duration
+	// txPollInterval: when mempool has txs, try seal this often (default 3s).
+	// Does not replace interval empty-block cadence.
+	txPollInterval time.Duration
+	// minSealGap: never seal two blocks closer than this (anti-burst).
+	minSealGap time.Duration
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	p2pNode  *p2p.Node
@@ -29,17 +34,33 @@ type Producer struct {
 
 	mu                   sync.Mutex
 	lastExternalProposal time.Time
+	lastSealAt           time.Time
 }
 
 func NewProducer(store *state.Store, interval time.Duration) *Producer {
 	if interval <= 0 {
 		interval = 120 * time.Second
 	}
+	// Env overrides (optional) — safe defaults keep old 3-minute empty seals.
+	txPoll := 3 * time.Second
+	if v := os.Getenv("TX_SEAL_POLL_MS"); v != "" {
+		if n, err := time.ParseDuration(v + "ms"); err == nil && n >= 500*time.Millisecond {
+			txPoll = n
+		}
+	}
+	minGap := 2 * time.Second
+	if v := os.Getenv("MIN_SEAL_GAP_MS"); v != "" {
+		if n, err := time.ParseDuration(v + "ms"); err == nil && n >= 500*time.Millisecond {
+			minGap = n
+		}
+	}
 	return &Producer{
-		store:    store,
-		interval: interval,
-		stopCh:   make(chan struct{}),
-		maxTxs:   100,
+		store:          store,
+		interval:       interval,
+		txPollInterval: txPoll,
+		minSealGap:     minGap,
+		stopCh:         make(chan struct{}),
+		maxTxs:         100,
 	}
 }
 
@@ -78,28 +99,51 @@ func (p *Producer) Stop() {
 
 func (p *Producer) loop() {
 	defer p.wg.Done()
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
+	// Empty / heartbeat blocks on the long interval (e.g. 180s).
+	emptyTicker := time.NewTicker(p.interval)
+	defer emptyTicker.Stop()
+	// Fast poll: only seals when mempool has pending txs.
+	txTicker := time.NewTicker(p.txPollInterval)
+	defer txTicker.Stop()
 
 	time.Sleep(2 * time.Second)
-	p.trySeal("boot")
+	p.trySeal("boot", false)
 
 	for {
 		select {
 		case <-p.stopCh:
 			return
-		case <-ticker.C:
-			p.trySeal("tick")
+		case <-emptyTicker.C:
+			// Allow empty block to advance height / keep chain alive
+			p.trySeal("tick", false)
+		case <-txTicker.C:
+			// Skip if mempool empty — no conflict with empty-interval logic
+			if p.pool == nil || p.pool.Size() == 0 {
+				continue
+			}
+			p.trySeal("mempool", true)
 		}
 	}
 }
 
-func (p *Producer) trySeal(reason string) {
+func (p *Producer) trySeal(reason string, requireTxs bool) {
 	p.mu.Lock()
-	recent := time.Since(p.lastExternalProposal) < p.interval
+	recentExt := time.Since(p.lastExternalProposal) < p.interval
+	sinceSeal := time.Since(p.lastSealAt)
+	minGap := p.minSealGap
+	if minGap <= 0 {
+		minGap = 2 * time.Second
+	}
 	p.mu.Unlock()
-	if recent {
+	if recentExt {
 		log.Debug().Str("reason", reason).Msg("skip auto-seal — external proposal just landed")
+		return
+	}
+	// Mempool-triggered seals: respect min gap so we don't spin at poll rate
+	if requireTxs && sinceSeal < minGap {
+		return
+	}
+	if requireTxs && (p.pool == nil || p.pool.Size() == 0) {
 		return
 	}
 
@@ -149,6 +193,10 @@ func (p *Producer) trySeal(reason string) {
 		log.Warn().Err(err).Str("reason", reason).Msg("auto-seal failed")
 		return
 	}
+
+	p.mu.Lock()
+	p.lastSealAt = time.Now()
+	p.mu.Unlock()
 
 	log.Info().
 		Uint64("height", result.Header.Height).

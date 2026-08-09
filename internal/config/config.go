@@ -18,6 +18,13 @@ type Config struct {
 	BlockInterval    time.Duration // auto-seal empty blocks every N (default 120s)
 	AutoProduce      bool          // enable auto block producer
 	EpochSeconds     int64         // uptime epoch length (default 7 days)
+
+	// Archive sync (startup catch-up from Vercel/Neon, block HEADERS only —
+	// no balance/stake data; see ops-migrate-neon for that). Empty
+	// ArchiveSyncURL disables this entirely.
+	ArchiveSyncURL        string
+	ChainSigningAddress   string // expected signer of archive block headers; empty = skip signature check (NOT recommended outside local dev)
+	ArchiveSyncEnabled    bool
 }
 
 func Load() Config {
@@ -45,18 +52,23 @@ func Load() Config {
 		}
 	}
 
+	archiveSyncURL := getEnv("ARCHIVE_SYNC_URL", "")
+
 	return Config{
-		HTTPAddr:         httpAddr,
-		DataDir:          getEnv("DATA_DIR", "./data"),
-		NodeID:           getEnv("NODE_ID", "validator-1"),
-		NodeName:         getEnv("NODE_NAME", "east-validator"),
-		APISecret:        getEnv("API_SECRET", ""),
-		KeepRecentBlocks: keepBlocks,
-		GenesisPath:      getEnv("GENESIS_PATH", "./genesis.json"),
-		ShutdownTimeout:  10 * time.Second,
-		BlockInterval:    time.Duration(intervalSec) * time.Second,
-		AutoProduce:      autoProduce,
-		EpochSeconds:     epochSec,
+		HTTPAddr:            httpAddr,
+		DataDir:             getEnv("DATA_DIR", "./data"),
+		NodeID:              getEnv("NODE_ID", "validator-1"),
+		NodeName:            getEnv("NODE_NAME", "east-validator"),
+		APISecret:           getEnv("API_SECRET", ""),
+		KeepRecentBlocks:    keepBlocks,
+		GenesisPath:         getEnv("GENESIS_PATH", "./genesis.json"),
+		ShutdownTimeout:     10 * time.Second,
+		BlockInterval:       time.Duration(intervalSec) * time.Second,
+		AutoProduce:         autoProduce,
+		EpochSeconds:        epochSec,
+		ArchiveSyncURL:      archiveSyncURL,
+		ChainSigningAddress: getEnv("CHAIN_SIGNING_ADDRESS", ""),
+		ArchiveSyncEnabled:  archiveSyncURL != "",
 	}
 }
 
