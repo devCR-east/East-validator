@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"time"
 	"syscall"
 
@@ -20,7 +18,6 @@ import (
 	"github.com/eastchain/east-validator/internal/mempool"
 	"github.com/eastchain/east-validator/internal/p2p"
 	"github.com/eastchain/east-validator/internal/state"
-	syncpkg "github.com/eastchain/east-validator/internal/sync"
 )
 
 func main() {
@@ -110,16 +107,6 @@ func main() {
 	}
 	defer p2pNode.Close()
 
-	// Tracks the highest block height seen from any peer's heartbeat —
-	// each heartbeat carries the sender's own store.GetLatestHeight() (see
-	// handleHeartbeat in internal/api/server.go), so this is a reasonable
-	// "what should I be caught up to" signal for the P2P sync loop below.
-	// p2p.Node.Stats() does NOT expose anything like this — don't assume
-	// it does without checking; verified against the actual Stats()
-	// implementation before writing this.
-	var highestPeerHeightMu sync.Mutex
-	var highestPeerHeight uint64
-
 	p2pNode.OnHeartbeat(func(m p2p.HeartbeatMsg) {
 		tier := state.TierLight
 		if m.Tier == "full" {
@@ -131,63 +118,11 @@ func main() {
 		if _, err := store.RecordHeartbeat(m.Address, m.NodeID, tier, cfg.EpochSeconds); err != nil {
 			log.Debug().Err(err).Msg("record remote heartbeat")
 		}
-		if m.Height > 0 {
-			highestPeerHeightMu.Lock()
-			if m.Height > highestPeerHeight {
-				highestPeerHeight = m.Height
-			}
-			highestPeerHeightMu.Unlock()
-		}
 	})
 
 	// Block-sync stream protocol so peers that fall behind can catch up
 	// without relying solely on gossip (which only covers the tip).
 	p2pNode.RegisterSyncHandler(p2p.StoreBlockProvider{Store: store})
-
-	// ── Startup catch-up sync ────────────────────────────────────────
-	// Header-only (no balance/stake — see internal/sync/archive.go's doc
-	// comment). Two sources, tried in order:
-	//   1. Archive (Vercel/Neon) — fast, always reachable if configured,
-	//      but Neon has stopped producing new blocks so it only ever
-	//      covers old history.
-	//   2. P2P peers — covers whatever archive sync couldn't (recent
-	//      blocks Neon never had). Doesn't block startup: if no peer is
-	//      connected yet, this validator still starts as a solo sealer
-	//      immediately (per Ferry's call — a validator shouldn't be stuck
-	//      unable to start just because peers haven't dialed in yet) and
-	//      a background loop keeps retrying every 30s so it catches up
-	//      automatically whenever a peer does show up, without needing a
-	//      manual restart.
-	archiveSyncCtx, archiveSyncCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	if cfg.ArchiveSyncEnabled {
-		targetHeight, err := syncpkg.FetchArchiveHeight(archiveSyncCtx, cfg.ArchiveSyncURL)
-		if err != nil {
-			log.Warn().Err(err).Msg("archive sync: could not fetch target height, skipping (validator will start from local state)")
-		} else if targetHeight > 0 {
-			if err := syncpkg.SyncFromArchive(archiveSyncCtx, store, cfg.ArchiveSyncURL, cfg.ChainSigningAddress, uint64(targetHeight)); err != nil {
-				log.Warn().Err(err).Msg("archive sync: failed partway, continuing with whatever was saved")
-			}
-		}
-	}
-	archiveSyncCancel()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			highestPeerHeightMu.Lock()
-			target := highestPeerHeight
-			highestPeerHeightMu.Unlock()
-			if target == 0 {
-				continue // no peer heartbeat with a height seen yet
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := syncpkg.SyncFromPeers(ctx, store, p2pNode, target); err != nil {
-				log.Debug().Err(err).Msg("p2p catch-up sync: attempt failed, will retry")
-			}
-			cancel()
-		}
-	}()
 
 	// ── BFT engine (default on) ─────────────────────────────────────
 	var bft *consensus.BFTEngine
