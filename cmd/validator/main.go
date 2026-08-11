@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
-	"time"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -18,6 +21,7 @@ import (
 	"github.com/eastchain/east-validator/internal/mempool"
 	"github.com/eastchain/east-validator/internal/p2p"
 	"github.com/eastchain/east-validator/internal/state"
+	chainsync "github.com/eastchain/east-validator/internal/sync"
 )
 
 func main() {
@@ -124,6 +128,14 @@ func main() {
 	// without relying solely on gossip (which only covers the tip).
 	p2pNode.RegisterSyncHandler(p2p.StoreBlockProvider{Store: store})
 
+	// ── Catch-up before consensus ───────────────────────────────────
+	// New nodes start at genesis height 0/1 while the network tip may be
+	// far ahead. Without header catch-up, solo BFT seals height 1 and
+	// both peers reject each other's blocks (score -10).
+	if os.Getenv("SYNC_BEFORE_CONSENSUS") != "false" {
+		runStartupCatchUp(store, p2pNode)
+	}
+
 	// ── BFT engine (default on) ─────────────────────────────────────
 	var bft *consensus.BFTEngine
 	if bftEnabled {
@@ -191,7 +203,24 @@ func main() {
 	}
 
 	p2pNode.OnBlock(func(a p2p.BlockAnnounce) {
-		// P0: verify sealer sig, proposer in set, full tx ValidateBasic, atomic apply
+		localH, _ := store.GetLatestHeight()
+		// Peer is ahead of us by more than one — need catch-up, not a penalty.
+		if a.Height > localH+1 {
+			log.Info().
+				Uint64("local", localH).
+				Uint64("peer_height", a.Height).
+				Str("from", a.FromPeer).
+				Msg("gossip block ahead of local tip — scheduling catch-up (no peer penalty)")
+			go func(target uint64) {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if err := chainsync.SyncFromPeers(ctx, store, p2pNode, target); err != nil {
+					log.Debug().Err(err).Uint64("target", target).Msg("runtime catch-up failed")
+				}
+			}(a.Height)
+			return
+		}
+
 		err := consensus.VerifyAndSaveGossipedBlockStrict(store, consensus.GossipBlockInput{
 			Height:           a.Height,
 			Hash:             a.Hash,
@@ -204,7 +233,12 @@ func main() {
 		})
 		if err != nil {
 			log.Debug().Err(err).Uint64("height", a.Height).Str("from", a.FromPeer).Msg("gossiped block rejected")
-			p2pNode.ReportPeer(a.FromPeer, -10, "invalid_block")
+			msg := err.Error()
+			if strings.Contains(msg, "stale or out of order") || strings.Contains(msg, "!= expected") {
+				p2pNode.ReportPeer(a.FromPeer, -1, "height_mismatch")
+			} else {
+				p2pNode.ReportPeer(a.FromPeer, -10, "invalid_block")
+			}
 			return
 		}
 		p2pNode.ReportPeer(a.FromPeer, +2, "valid_block")
