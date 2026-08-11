@@ -71,16 +71,13 @@ func main() {
 		log.Fatal().Err(err).Msg("genesis init failed")
 	}
 
-	// Local proposer identity
 	localAddr := os.Getenv("CHAIN_SIGNING_ADDRESS")
 	if localAddr == "" && os.Getenv("CHAIN_SIGNING_PRIVATE_KEY") != "" {
 		// derived later in producer / BFT if needed
 	}
 
-	// Leader schedule (CometBFT-style round-robin when 2+ validators)
 	leader := consensus.NewLeaderSchedule(localAddr)
 	leader.SetStore(store)
-	// Prefer persisted set (survives restart); env overrides on first boot / ops change.
 	if raw := os.Getenv("VALIDATORS"); raw != "" {
 		parts := strings.Split(raw, ",")
 		var addrs []string
@@ -90,20 +87,17 @@ func main() {
 				addrs = append(addrs, p)
 			}
 		}
-		leader.SetValidators(addrs) // also persists
+		leader.SetValidators(addrs)
 		log.Info().Int("count", len(addrs)).Msg("validator set loaded from VALIDATORS env (persisted)")
 	} else if leader.LoadFromStore() {
 		log.Info().Int("count", leader.Count()).Msg("validator set loaded from local store")
 	} else if localAddr != "" {
-		// Solo: register self so stats are consistent
 		leader.SetValidators([]string{localAddr})
 		log.Info().Str("local", localAddr).Msg("validator set: solo self-registration")
 	}
 
-	// Mempool
 	pool := mempool.New(store, mempool.DefaultConfig())
 
-	// libp2p
 	p2pCfg := p2p.LoadConfigFromEnv(cfg.NodeID)
 	p2pNode, err := p2p.New(p2pCfg)
 	if err != nil {
@@ -124,19 +118,14 @@ func main() {
 		}
 	})
 
-	// Block-sync stream protocol so peers that fall behind can catch up
-	// without relying solely on gossip (which only covers the tip).
 	p2pNode.RegisterSyncHandler(p2p.StoreBlockProvider{Store: store})
 
-	// ── Catch-up before consensus ───────────────────────────────────
-	// New nodes start at genesis height 0/1 while the network tip may be
-	// far ahead. Without header catch-up, solo BFT seals height 1 and
-	// both peers reject each other's blocks (score -10).
+	// Catch-up before consensus so a fresh node does not seal height 1
+	// while the network tip is already far ahead.
 	if os.Getenv("SYNC_BEFORE_CONSENSUS") != "false" {
 		runStartupCatchUp(store, p2pNode)
 	}
 
-	// ── BFT engine (default on) ─────────────────────────────────────
 	var bft *consensus.BFTEngine
 	if bftEnabled {
 		bftCfg := consensus.DefaultBFTConfig()
@@ -144,7 +133,6 @@ func main() {
 		if bftCfg.MinBlockInterval <= 0 {
 			bftCfg.MinBlockInterval = 120 * time.Second
 		}
-		// Optional overrides (seconds). Defaults: propose/prevote/precommit = 5.
 		if v := os.Getenv("BFT_PROPOSE_TIMEOUT_SEC"); v != "" {
 			if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
 				bftCfg.ProposeTimeout = n
@@ -167,7 +155,6 @@ func main() {
 		bft.Start()
 		defer bft.Stop()
 
-		// Wire P2P consensus messages into the engine
 		p2pNode.OnConsensus(func(m p2p.ConsensusMsg) {
 			switch m.Kind {
 			case p2p.ConsensusKindProposal:
@@ -179,7 +166,6 @@ func main() {
 					bft.HandleVote(consensus.VoteFromP2P(m.Vote))
 				}
 			case p2p.ConsensusKindCommit:
-				// Informational — block body still arrives via TopicBlocks
 				if m.Commit != nil {
 					log.Debug().
 						Uint64("height", m.Commit.Height).
@@ -191,7 +177,6 @@ func main() {
 		})
 	}
 
-	// Legacy auto-producer: only when BFT is disabled (backward compatible)
 	var producer *consensus.Producer
 	if cfg.AutoProduce && !bftEnabled {
 		producer = consensus.NewProducer(store, cfg.BlockInterval)
@@ -204,7 +189,6 @@ func main() {
 
 	p2pNode.OnBlock(func(a p2p.BlockAnnounce) {
 		localH, _ := store.GetLatestHeight()
-		// Peer is ahead of us by more than one — need catch-up, not a penalty.
 		if a.Height > localH+1 {
 			log.Info().
 				Uint64("local", localH).
@@ -276,4 +260,120 @@ func main() {
 	if err := srv.Start(); err != nil && err != http.ErrServerClosed {
 		log.Fatal().Err(err).Msg("http server failed")
 	}
+}
+
+func runStartupCatchUp(store *state.Store, node *p2p.Node) {
+	if node == nil || !node.Enabled() {
+		log.Info().Msg("catch-up skipped (p2p disabled)")
+		return
+	}
+
+	waitSec := 30
+	if v := os.Getenv("SYNC_PEER_WAIT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			waitSec = n
+		}
+	}
+
+	log.Info().Int("wait_sec", waitSec).Msg("catch-up: waiting for P2P peer before consensus")
+	deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
+	for time.Now().Before(deadline) {
+		if node.PeerCount() > 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if node.PeerCount() == 0 {
+		log.Warn().Msg("catch-up: no peers yet — starting consensus from local tip (solo until peer appears)")
+		return
+	}
+
+	localH, err := store.GetLatestHeight()
+	if err != nil {
+		log.Warn().Err(err).Msg("catch-up: cannot read local height")
+		return
+	}
+
+	target := fetchTipHeight()
+	if target == 0 {
+		target = probePeerTip(node, localH)
+	}
+	if target <= localH {
+		log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: already at or past tip")
+		return
+	}
+
+	log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: syncing headers from peers before consensus")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := chainsync.SyncFromPeers(ctx, store, node, target); err != nil {
+		log.Warn().Err(err).Msg("catch-up: SyncFromPeers failed — consensus will start from local tip")
+		return
+	}
+	after, _ := store.GetLatestHeight()
+	log.Info().Uint64("height", after).Msg("catch-up: complete — starting consensus")
+}
+
+func fetchTipHeight() uint64 {
+	base := strings.TrimSpace(os.Getenv("CATCHUP_TIP_URL"))
+	if base == "" {
+		return 0
+	}
+	base = strings.TrimRight(base, "/")
+	url := base
+	if !strings.Contains(base, "/block/") {
+		url = base + "/block/latest"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Debug().Err(err).Str("url", url).Msg("catch-up: tip HTTP failed")
+		return 0
+	}
+	defer res.Body.Close()
+	var body struct {
+		Height uint64 `json:"height"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return 0
+	}
+	log.Info().Uint64("tip", body.Height).Str("url", url).Msg("catch-up: network tip from HTTP")
+	return body.Height
+}
+
+func probePeerTip(node *p2p.Node, localH uint64) uint64 {
+	if node.Host() == nil {
+		return localH
+	}
+	peers := node.Host().Network().Peers()
+	if len(peers) == 0 {
+		return localH
+	}
+	guess := localH + 500
+	if guess < 500 {
+		guess = 500
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	blocks, err := node.RequestBlocks(ctx, peers[0], localH+1, guess)
+	if err != nil || len(blocks) == 0 {
+		log.Debug().Err(err).Msg("catch-up: peer tip probe empty")
+		return localH
+	}
+	var max uint64
+	for _, b := range blocks {
+		if b.Height > max {
+			max = b.Height
+		}
+	}
+	if len(blocks) >= 50 {
+		max = max + 500
+	}
+	log.Info().Uint64("probed_tip", max).Msg("catch-up: tip estimated from peer blocksync")
+	return max
 }
