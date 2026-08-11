@@ -385,12 +385,34 @@ func (e *BFTEngine) loop() {
 }
 
 // waitBlockInterval sleeps until MinBlockInterval has elapsed since last commit.
-// Solo BFT reaches +2/3 instantly; without this, blocks seal every ~100ms.
+// Solo BFT reaches +2/3 instantly; without this, empty blocks would seal every ~100ms.
+//
+// When the mempool has pending txs, use a short interval (default 3s, env
+// BFT_TX_MIN_INTERVAL_MS) so send/stake are not stuck behind the empty-block
+// cadence (e.g. 180s). Empty mempool keeps the full MinBlockInterval.
 func (e *BFTEngine) waitBlockInterval() {
 	interval := e.cfg.MinBlockInterval
 	if interval <= 0 {
 		interval = 120 * time.Second
 	}
+
+	mempoolN := 0
+	if e.pool != nil {
+		mempoolN = e.pool.Size()
+	}
+	// Fast path: pending user txs → do not wait full empty-block interval
+	if mempoolN > 0 {
+		fast := 3 * time.Second
+		if v := os.Getenv("BFT_TX_MIN_INTERVAL_MS"); v != "" {
+			if n, err := time.ParseDuration(v + "ms"); err == nil && n >= 500*time.Millisecond {
+				fast = n
+			}
+		}
+		if fast < interval {
+			interval = fast
+		}
+	}
+
 	e.mu.Lock()
 	last := e.lastCommitAt
 	e.mu.Unlock()
@@ -405,6 +427,7 @@ func (e *BFTEngine) waitBlockInterval() {
 	log.Debug().
 		Dur("wait", wait).
 		Dur("interval", interval).
+		Int("mempool", mempoolN).
 		Msg("BFT: pacing next height to MinBlockInterval")
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
