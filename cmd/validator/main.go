@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -120,8 +121,6 @@ func main() {
 
 	p2pNode.RegisterSyncHandler(p2p.StoreBlockProvider{Store: store})
 
-	// Catch-up before consensus so a fresh node does not seal height 1
-	// while the network tip is already far ahead.
 	if os.Getenv("SYNC_BEFORE_CONSENSUS") != "false" {
 		runStartupCatchUp(store, p2pNode)
 	}
@@ -196,10 +195,17 @@ func main() {
 				Str("from", a.FromPeer).
 				Msg("gossip block ahead of local tip — scheduling catch-up (no peer penalty)")
 			go func(target uint64) {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 				defer cancel()
+				// Prefer HTTP if configured (works even when PeerCount is wrong).
+				if tipURL := strings.TrimSpace(os.Getenv("CATCHUP_TIP_URL")); tipURL != "" {
+					if err := syncHeadersHTTP(ctx, store, tipURL, target); err != nil {
+						log.Debug().Err(err).Msg("runtime HTTP catch-up failed")
+					}
+					return
+				}
 				if err := chainsync.SyncFromPeers(ctx, store, p2pNode, target); err != nil {
-					log.Debug().Err(err).Uint64("target", target).Msg("runtime catch-up failed")
+					log.Debug().Err(err).Uint64("target", target).Msg("runtime P2P catch-up failed")
 				}
 			}(a.Height)
 			return
@@ -262,60 +268,85 @@ func main() {
 	}
 }
 
+// livePeerCount uses the libp2p host mesh (authoritative), not the internal
+// peerCount counter which can miss bootstrap connects that race NotifyBundle.
+func livePeerCount(node *p2p.Node) int {
+	if node == nil || node.Host() == nil {
+		return 0
+	}
+	return len(node.Host().Network().Peers())
+}
+
 func runStartupCatchUp(store *state.Store, node *p2p.Node) {
-	if node == nil || !node.Enabled() {
-		log.Info().Msg("catch-up skipped (p2p disabled)")
-		return
-	}
-
-	waitSec := 30
-	if v := os.Getenv("SYNC_PEER_WAIT_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			waitSec = n
-		}
-	}
-
-	log.Info().Int("wait_sec", waitSec).Msg("catch-up: waiting for P2P peer before consensus")
-	deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
-	for time.Now().Before(deadline) {
-		if node.PeerCount() > 0 {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if node.PeerCount() == 0 {
-		log.Warn().Msg("catch-up: no peers yet — starting consensus from local tip (solo until peer appears)")
-		return
-	}
-
 	localH, err := store.GetLatestHeight()
 	if err != nil {
 		log.Warn().Err(err).Msg("catch-up: cannot read local height")
 		return
 	}
 
-	target := fetchTipHeight()
+	// 1) Always try HTTP tip first (does not need P2P peers).
+	tipURL := strings.TrimSpace(os.Getenv("CATCHUP_TIP_URL"))
+	target := fetchTipHeight(tipURL)
+	if target > localH && tipURL != "" {
+		log.Info().Uint64("local", localH).Uint64("target", target).Str("url", tipURL).
+			Msg("catch-up: syncing headers via HTTP from CATCHUP_TIP_URL")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := syncHeadersHTTP(ctx, store, tipURL, target); err != nil {
+			log.Warn().Err(err).Msg("catch-up: HTTP header sync failed")
+		} else {
+			after, _ := store.GetLatestHeight()
+			log.Info().Uint64("height", after).Msg("catch-up: HTTP sync complete")
+			localH = after
+			if localH >= target {
+				return
+			}
+		}
+	}
+
+	// 2) Wait briefly for live libp2p peers, then P2P blocksync.
+	waitSec := 45
+	if v := os.Getenv("SYNC_PEER_WAIT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			waitSec = n
+		}
+	}
+	log.Info().Int("wait_sec", waitSec).Msg("catch-up: waiting for live P2P peers")
+	deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
+	for time.Now().Before(deadline) {
+		if livePeerCount(node) > 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	nPeers := livePeerCount(node)
+	if nPeers == 0 {
+		log.Warn().Uint64("local", localH).Msg("catch-up: no live P2P peers — consensus starts from local tip")
+		return
+	}
+	log.Info().Int("peers", nPeers).Msg("catch-up: live peers detected")
+
 	if target == 0 {
 		target = probePeerTip(node, localH)
 	}
 	if target <= localH {
-		log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: already at or past tip")
+		log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: already at tip")
 		return
 	}
 
-	log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: syncing headers from peers before consensus")
+	log.Info().Uint64("local", localH).Uint64("target", target).Msg("catch-up: P2P blocksync")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := chainsync.SyncFromPeers(ctx, store, node, target); err != nil {
-		log.Warn().Err(err).Msg("catch-up: SyncFromPeers failed — consensus will start from local tip")
+		log.Warn().Err(err).Msg("catch-up: SyncFromPeers failed")
 		return
 	}
 	after, _ := store.GetLatestHeight()
-	log.Info().Uint64("height", after).Msg("catch-up: complete — starting consensus")
+	log.Info().Uint64("height", after).Msg("catch-up: P2P sync complete — starting consensus")
 }
 
-func fetchTipHeight() uint64 {
-	base := strings.TrimSpace(os.Getenv("CATCHUP_TIP_URL"))
+func fetchTipHeight(base string) uint64 {
+	base = strings.TrimSpace(base)
 	if base == "" {
 		return 0
 	}
@@ -324,7 +355,7 @@ func fetchTipHeight() uint64 {
 	if !strings.Contains(base, "/block/") {
 		url = base + "/block/latest"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -332,7 +363,7 @@ func fetchTipHeight() uint64 {
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Debug().Err(err).Str("url", url).Msg("catch-up: tip HTTP failed")
+		log.Warn().Err(err).Str("url", url).Msg("catch-up: tip HTTP failed")
 		return 0
 	}
 	defer res.Body.Close()
@@ -340,10 +371,68 @@ func fetchTipHeight() uint64 {
 		Height uint64 `json:"height"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		log.Warn().Err(err).Msg("catch-up: tip JSON decode failed")
 		return 0
 	}
 	log.Info().Uint64("tip", body.Height).Str("url", url).Msg("catch-up: network tip from HTTP")
 	return body.Height
+}
+
+// syncHeadersHTTP pulls /block/{h} from tipBase for each missing height and
+// saves BlockHeader rows so local tip can advance without P2P.
+func syncHeadersHTTP(ctx context.Context, store *state.Store, tipBase string, target uint64) error {
+	tipBase = strings.TrimRight(strings.TrimSpace(tipBase), "/")
+	if tipBase == "" {
+		return fmt.Errorf("empty CATCHUP_TIP_URL")
+	}
+	localH, err := store.GetLatestHeight()
+	if err != nil {
+		return err
+	}
+	if localH >= target {
+		return nil
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	saved := 0
+	for h := localH + 1; h <= target; h++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		url := fmt.Sprintf("%s/block/%d", tipBase, h)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("GET %s: %w", url, err)
+		}
+		var hdr state.BlockHeader
+		decErr := json.NewDecoder(res.Body).Decode(&hdr)
+		res.Body.Close()
+		if res.StatusCode != 200 {
+			return fmt.Errorf("GET %s: status %d", url, res.StatusCode)
+		}
+		if decErr != nil {
+			return fmt.Errorf("decode block %d: %w", h, decErr)
+		}
+		if hdr.Height == 0 {
+			hdr.Height = h
+		}
+		current, _ := store.GetLatestHeight()
+		if hdr.Height <= current {
+			continue
+		}
+		if err := store.SaveBlock(hdr); err != nil {
+			return fmt.Errorf("save block %d: %w", hdr.Height, err)
+		}
+		saved++
+		if saved%50 == 0 {
+			log.Info().Int("saved", saved).Uint64("height", hdr.Height).Msg("catch-up: HTTP progress")
+		}
+	}
+	log.Info().Int("saved", saved).Msg("catch-up: HTTP headers saved")
+	return nil
 }
 
 func probePeerTip(node *p2p.Node, localH uint64) uint64 {
