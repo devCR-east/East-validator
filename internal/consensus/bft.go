@@ -201,12 +201,27 @@ func (e *BFTEngine) HandleProposal(p *Proposal) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if p.Height != e.height {
-		log.Debug().Uint64("got", p.Height).Uint64("want", e.height).Msg("BFT: proposal for wrong height")
+	if p.Height < e.height {
+		log.Debug().Uint64("got", p.Height).Uint64("want", e.height).Msg("BFT: proposal for stale height")
 		return
 	}
-	if p.Round != e.round {
-		log.Debug().Int32("got", p.Round).Int32("want", e.round).Msg("BFT: proposal for wrong round")
+	// Behind the leader's height: do not vote yet — wait for block catch-up.
+	if p.Height > e.height {
+		log.Info().Uint64("got", p.Height).Uint64("local", e.height).Msg("BFT: proposal ahead — follower waiting for height catch-up")
+		return
+	}
+	// Same height, higher round: jump to leader's round (follower yields).
+	if p.Round > e.round {
+		log.Info().Int32("from", e.round).Int32("to", p.Round).Uint64("height", p.Height).
+			Msg("BFT: adopting higher round from proposal (follow leader)")
+		e.round = p.Round
+		e.step = StepPropose
+		e.proposal = nil
+		e.prevotes = make(map[string]*Vote)
+		e.precommits = make(map[string]*Vote)
+		e.pendingTxs = nil
+	} else if p.Round < e.round {
+		log.Debug().Int32("got", p.Round).Int32("want", e.round).Msg("BFT: proposal for older round — ignored")
 		return
 	}
 	if e.step > StepPropose {
@@ -270,6 +285,22 @@ func (e *BFTEngine) HandleVote(v *Vote) {
 			log.Debug().Str("voter", v.Voter).Msg("BFT: vote from jailed validator — ignored")
 			return
 		}
+	}
+
+	// Follower: adopt higher round on same height so we can vote with the leader.
+	if v.Height == e.height && v.Round > e.round {
+		log.Info().Int32("from", e.round).Int32("to", v.Round).Uint64("height", v.Height).
+			Str("voter", v.Voter).Msg("BFT: adopting higher round from vote (follow leader)")
+		e.round = v.Round
+		e.step = StepPropose
+		e.proposal = nil
+		e.prevotes = make(map[string]*Vote)
+		e.precommits = make(map[string]*Vote)
+		e.pendingTxs = nil
+	}
+	if v.Height != e.height {
+		log.Debug().Uint64("got", v.Height).Uint64("want", e.height).Msg("BFT: vote for wrong height")
+		return
 	}
 
 	// Only accept votes from the current validator set
