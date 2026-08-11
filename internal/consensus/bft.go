@@ -384,32 +384,22 @@ func (e *BFTEngine) loop() {
 	}
 }
 
-// waitBlockInterval sleeps until MinBlockInterval has elapsed since last commit.
-// Solo BFT reaches +2/3 instantly; without this, empty blocks would seal every ~100ms.
+// waitBlockInterval paces production after the last commit.
+// Empty mempool → full MinBlockInterval (e.g. 180s).
+// Mempool has txs → only BFT_TX_MIN_INTERVAL_MS (default 3s).
 //
-// When the mempool has pending txs, use a short interval (default 3s, env
-// BFT_TX_MIN_INTERVAL_MS) so send/stake are not stuck behind the empty-block
-// cadence (e.g. 180s). Empty mempool keeps the full MinBlockInterval.
+// IMPORTANT: re-check mempool every second while sleeping. Otherwise a tx that
+// arrives mid-wait (after an empty-mempool wait started) still waits the full
+// 180s — which is what users see on stake/send.
 func (e *BFTEngine) waitBlockInterval() {
-	interval := e.cfg.MinBlockInterval
-	if interval <= 0 {
-		interval = 120 * time.Second
+	emptyInterval := e.cfg.MinBlockInterval
+	if emptyInterval <= 0 {
+		emptyInterval = 120 * time.Second
 	}
-
-	mempoolN := 0
-	if e.pool != nil {
-		mempoolN = e.pool.Size()
-	}
-	// Fast path: pending user txs → do not wait full empty-block interval
-	if mempoolN > 0 {
-		fast := 3 * time.Second
-		if v := os.Getenv("BFT_TX_MIN_INTERVAL_MS"); v != "" {
-			if n, err := time.ParseDuration(v + "ms"); err == nil && n >= 500*time.Millisecond {
-				fast = n
-			}
-		}
-		if fast < interval {
-			interval = fast
+	fastInterval := 3 * time.Second
+	if v := os.Getenv("BFT_TX_MIN_INTERVAL_MS"); v != "" {
+		if n, err := time.ParseDuration(v + "ms"); err == nil && n >= 500*time.Millisecond {
+			fastInterval = n
 		}
 	}
 
@@ -419,23 +409,35 @@ func (e *BFTEngine) waitBlockInterval() {
 	if last.IsZero() {
 		return
 	}
-	elapsed := time.Since(last)
-	if elapsed >= interval {
-		return
-	}
-	wait := interval - elapsed
-	log.Debug().
-		Dur("wait", wait).
-		Dur("interval", interval).
-		Int("mempool", mempoolN).
-		Msg("BFT: pacing next height to MinBlockInterval")
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-e.stopCh:
-		return
-	case <-timer.C:
-		return
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+		}
+
+		mempoolN := 0
+		if e.pool != nil {
+			mempoolN = e.pool.Size()
+		}
+		need := emptyInterval
+		if mempoolN > 0 {
+			need = fastInterval
+		}
+		elapsed := time.Since(last)
+		if elapsed >= need {
+			if mempoolN > 0 {
+				log.Debug().
+					Dur("elapsed", elapsed).
+					Dur("need", need).
+					Int("mempool", mempoolN).
+					Msg("BFT: mempool non-empty — releasing pace early")
+			}
+			return
+		}
 	}
 }
 
@@ -831,7 +833,7 @@ func (e *BFTEngine) advanceHeightLocked() {
 
 func (e *BFTEngine) soloSeal(height uint64) {
 	// Same path as old Producer.trySeal for n<=1
-	e.waitBlockInterval()
+	// Do NOT waitBlockInterval here — runPropose already paced (and re-checks mempool).
 	sealerKey := e.privKey
 	proposer := e.localAddr
 	if proposer == "" {
