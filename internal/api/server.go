@@ -65,6 +65,8 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/admin/prune", s.auth(s.handlePrune)).Methods("POST")
 	r.HandleFunc("/admin/backup", s.auth(s.handleBackup)).Methods("POST")
 	r.HandleFunc("/admin/restore-accounts", s.auth(s.handleRestoreAccounts)).Methods("POST")
+	r.HandleFunc("/admin/snapshot", s.auth(s.handleGetSnapshot)).Methods("GET")
+	r.HandleFunc("/admin/import-snapshot", s.auth(s.handleImportSnapshot)).Methods("POST")
 	r.HandleFunc("/admin/jail", s.handleListJailed).Methods("GET")
 	r.HandleFunc("/admin/unjail", s.auth(s.handleUnjail)).Methods("POST")
 
