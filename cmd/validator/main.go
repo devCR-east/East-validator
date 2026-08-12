@@ -69,6 +69,21 @@ func main() {
 		log.Fatal().Err(err).Msg("genesis init failed")
 	}
 
+	// Optional header-only backfill from the legacy Neon/Vercel archive,
+	// so this node's chain is structurally continuous (prevHash matches)
+	// even for heights it never produced/received itself. Does not touch
+	// balances/stake — see internal/sync/archive.go's package comment.
+	if archiveBaseURL := os.Getenv("ARCHIVE_SYNC_URL"); archiveBaseURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		archiveSigner := os.Getenv("ARCHIVE_CHAIN_SIGNING_ADDRESS")
+		if targetHeight, err := chainsync.FetchArchiveHeight(ctx, archiveBaseURL); err != nil {
+			log.Warn().Err(err).Msg("archive sync: failed to fetch archive tip — continuing without backfill")
+		} else if err := chainsync.SyncFromArchive(ctx, store, archiveBaseURL, archiveSigner, uint64(targetHeight)); err != nil {
+			log.Warn().Err(err).Msg("archive sync failed — continuing with local state")
+		}
+		cancel()
+	}
+
 	// Optional full state pull from primary (balances/stake/buckets).
 	if os.Getenv("STATE_SYNC_URL") != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)

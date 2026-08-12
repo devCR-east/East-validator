@@ -58,18 +58,24 @@ type heightResponse struct {
 	Error  string `json:"error"`
 }
 
-// FetchArchiveHeight asks Vercel for Neon's current chain height — see
-// src/app/api/chain-height/route.ts's own comment on why this is asked
-// rather than trusted from any self-reported figure.
+// FetchArchiveHeight asks Vercel for the archive's own tip height.
+//
+// NOTE: this deliberately does NOT call /api/chain-height — that route
+// proxies back to the validator's own /block/latest (see its own comment:
+// it exists so Light Nodes don't sync a stale Neon height, not to expose
+// Neon's height). Calling it from the validator at startup would be
+// circular: the validator has no height yet, so it would just ask itself.
+// /api/archive/headers?tip=1 queries ledger.chain_meta / ledger.blocks
+// directly and is the actual archive tip.
 func FetchArchiveHeight(ctx context.Context, baseURL string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/chain-height", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/archive/headers?tip=1", nil)
 	if err != nil {
 		return 0, err
 	}
 	client := &http.Client{Timeout: archiveTimeout}
 	res, err := client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("chain-height request: %w", err)
+		return 0, fmt.Errorf("archive tip request: %w", err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
@@ -77,14 +83,18 @@ func FetchArchiveHeight(ctx context.Context, baseURL string) (int64, error) {
 		return 0, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("chain-height: HTTP %d: %s", res.StatusCode, string(body))
+		return 0, fmt.Errorf("archive tip: HTTP %d: %s", res.StatusCode, string(body))
 	}
 	var hr heightResponse
 	if err := json.Unmarshal(body, &hr); err != nil {
-		return 0, fmt.Errorf("chain-height: decode: %w", err)
+		return 0, fmt.Errorf("archive tip: decode: %w", err)
 	}
 	if hr.Error != "" {
-		return 0, fmt.Errorf("chain-height: %s", hr.Error)
+		return 0, fmt.Errorf("archive tip: %s", hr.Error)
+	}
+	if hr.Height < 0 {
+		// /api/archive/headers?tip=1 returns {height:-1} when the archive is empty
+		return 0, fmt.Errorf("archive tip: archive is empty")
 	}
 	return hr.Height, nil
 }

@@ -576,6 +576,38 @@ func (s *Server) handleRestoreAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts_applied": n})
 }
 
+func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	maxBlocks := 500
+	if v := r.URL.Query().Get("max_blocks"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxBlocks = n
+		}
+	}
+	snap, err := s.store.BuildSnapshot(maxBlocks)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *Server) handleImportSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Snapshot *state.BackupSnapshot `json:"snapshot"`
+		Force    bool                  `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Snapshot == nil {
+		http.Error(w, "snapshot required", http.StatusBadRequest)
+		return
+	}
+	n, err := s.store.ImportSnapshot(req.Snapshot, req.Force)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts_applied": n})
+}
+
 func (s *Server) handleListJailed(w http.ResponseWriter, r *http.Request) {
 	list, err := s.store.ListJailed(200)
 	if err != nil {
