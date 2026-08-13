@@ -270,7 +270,19 @@ func (s *Store) ApplyTx(t *tx.Transaction) error {
 		if err != nil {
 			return err
 		}
-		if t.Nonce > 0 && t.Nonce <= fromAcc.Nonce {
+		// Reject nonce <= current unconditionally — including nonce == 0.
+		// (Previously `t.Nonce > 0 && t.Nonce <= fromAcc.Nonce` skipped this
+		// check entirely for nonce == 0, meaning ANY tx signed with nonce=0
+		// could be resubmitted indefinitely and re-applied every time — a
+		// balance-draining/re-mint replay attack requiring no private key,
+		// only a copy of a single previously-valid signed tx. The mempool's
+		// `seen` hash cache is not a substitute for this: it's in-memory,
+		// LRU-capped, and wiped on every validator restart, so it only
+		// slows a replay down, it never durably prevents one.
+		// Legitimate clients always request nonce = currentNonce+1 (never
+		// 0) — see east-wallet's fetchChainNonce — so this tightens
+		// nothing for honest use, only closes the exploit.
+		if t.Nonce <= fromAcc.Nonce {
 			return fmt.Errorf("invalid nonce: got %d, current %d", t.Nonce, fromAcc.Nonce)
 		}
 

@@ -67,7 +67,9 @@ func (m *Mempool) CheckTx(t *tx.Transaction) error {
 	if err != nil {
 		return err
 	}
-	if t.Nonce > 0 && t.Nonce <= acc.Nonce {
+	// Same fix as state.go's ApplyTx — nonce == 0 must NOT bypass this
+	// check. See the comment there for why (replay attack via nonce=0).
+	if t.Nonce <= acc.Nonce {
 		return fmt.Errorf("invalid nonce: got %d, current %d", t.Nonce, acc.Nonce)
 	}
 	switch t.Type {
