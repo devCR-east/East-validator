@@ -43,6 +43,8 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/account/{address}/proof", s.handleAccountProof).Methods("GET")
 	r.HandleFunc("/block/latest", s.handleLatestBlock).Methods("GET")
 	r.HandleFunc("/block/{height}", s.handleGetBlock).Methods("GET")
+	r.HandleFunc("/tx/{hash}", s.handleGetTx).Methods("GET")
+	r.HandleFunc("/transaction/{hash}", s.handleGetTx).Methods("GET")
 	r.HandleFunc("/supply", s.handleSupply).Methods("GET")
 	r.HandleFunc("/supply/{bucket}", s.handleBucket).Methods("GET")
 
@@ -65,8 +67,6 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/admin/prune", s.auth(s.handlePrune)).Methods("POST")
 	r.HandleFunc("/admin/backup", s.auth(s.handleBackup)).Methods("POST")
 	r.HandleFunc("/admin/restore-accounts", s.auth(s.handleRestoreAccounts)).Methods("POST")
-	r.HandleFunc("/admin/snapshot", s.auth(s.handleGetSnapshot)).Methods("GET")
-	r.HandleFunc("/admin/import-snapshot", s.auth(s.handleImportSnapshot)).Methods("POST")
 	r.HandleFunc("/admin/jail", s.handleListJailed).Methods("GET")
 	r.HandleFunc("/admin/unjail", s.auth(s.handleUnjail)).Methods("POST")
 
@@ -173,7 +173,12 @@ func (s *Server) handleLatestBlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, h)
+	txs, _ := s.store.GetBlockTransactions(height)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"height": h.Height, "hash": h.Hash, "prev_hash": h.PrevHash, "state_root": h.StateRoot,
+		"tx_hashes": h.TxHashes, "timestamp": h.Timestamp, "proposer": h.Proposer,
+		"tx_count": h.TxCount, "signature": h.Signature, "transactions": txs,
+	})
 }
 
 func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +192,34 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "block not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, h)
+	txs, _ := s.store.GetBlockTransactions(height)
+	// Always return body so explorers never show EMPTY when tx_count > 0
+	writeJSON(w, http.StatusOK, map[string]any{
+		"height":     h.Height,
+		"hash":       h.Hash,
+		"prev_hash":  h.PrevHash,
+		"state_root": h.StateRoot,
+		"tx_hashes":  h.TxHashes,
+		"timestamp":  h.Timestamp,
+		"proposer":   h.Proposer,
+		"tx_count":   h.TxCount,
+		"signature":  h.Signature,
+		"transactions": txs, // full bodies when sealed with SaveBlockWithTxs
+	})
+}
+
+func (s *Server) handleGetTx(w http.ResponseWriter, r *http.Request) {
+	hash := mux.Vars(r)["hash"]
+	if hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	st, err := s.store.GetTransaction(hash)
+	if err != nil {
+		http.Error(w, "transaction not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleSupply(w http.ResponseWriter, r *http.Request) {
@@ -569,38 +601,6 @@ func (s *Server) handleRestoreAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := s.store.RestoreAccountsFromSnapshot(req.Path, req.Force)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts_applied": n})
-}
-
-func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
-	maxBlocks := 500
-	if v := r.URL.Query().Get("max_blocks"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxBlocks = n
-		}
-	}
-	snap, err := s.store.BuildSnapshot(maxBlocks)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, http.StatusOK, snap)
-}
-
-func (s *Server) handleImportSnapshot(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Snapshot *state.BackupSnapshot `json:"snapshot"`
-		Force    bool                  `json:"force"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Snapshot == nil {
-		http.Error(w, "snapshot required", http.StatusBadRequest)
-		return
-	}
-	n, err := s.store.ImportSnapshot(req.Snapshot, req.Force)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

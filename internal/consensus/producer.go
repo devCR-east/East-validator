@@ -232,7 +232,7 @@ func SealBlockWithTxs(store *state.Store, sealerPrivKey, proposer string, txs []
 		Signature: sealerSig,
 	}
 
-	if err := store.SaveBlock(header); err != nil {
+	if err := store.SaveBlockWithTxs(header, applied); err != nil {
 		return nil, err
 	}
 	return &SealResult{Header: header, SealerSig: sealerSig, Txs: applied}, nil
