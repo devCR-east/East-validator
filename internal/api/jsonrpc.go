@@ -105,6 +105,16 @@ func (s *Server) dispatchRPC(method string, params json.RawMessage) (any, error)
 			return nil, nil
 		}
 		return blockToRPC(blk), nil
+	case "eth_getTransactionByHash":
+		var p []string
+		if err := json.Unmarshal(params, &p); err != nil || len(p) < 1 {
+			return nil, fmt.Errorf("invalid params")
+		}
+		st, err := s.store.GetTransaction(p[0])
+		if err != nil {
+			return nil, nil // eth convention: null if not found
+		}
+		return st, nil
 	case "eth_getTransactionCount":
 		var p []string
 		if err := json.Unmarshal(params, &p); err != nil || len(p) < 1 {

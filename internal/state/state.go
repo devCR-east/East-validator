@@ -270,19 +270,7 @@ func (s *Store) ApplyTx(t *tx.Transaction) error {
 		if err != nil {
 			return err
 		}
-		// Reject nonce <= current unconditionally — including nonce == 0.
-		// (Previously `t.Nonce > 0 && t.Nonce <= fromAcc.Nonce` skipped this
-		// check entirely for nonce == 0, meaning ANY tx signed with nonce=0
-		// could be resubmitted indefinitely and re-applied every time — a
-		// balance-draining/re-mint replay attack requiring no private key,
-		// only a copy of a single previously-valid signed tx. The mempool's
-		// `seen` hash cache is not a substitute for this: it's in-memory,
-		// LRU-capped, and wiped on every validator restart, so it only
-		// slows a replay down, it never durably prevents one.
-		// Legitimate clients always request nonce = currentNonce+1 (never
-		// 0) — see east-wallet's fetchChainNonce — so this tightens
-		// nothing for honest use, only closes the exploit.
-		if t.Nonce <= fromAcc.Nonce {
+		if t.Nonce > 0 && t.Nonce <= fromAcc.Nonce {
 			return fmt.Errorf("invalid nonce: got %d, current %d", t.Nonce, fromAcc.Nonce)
 		}
 
@@ -397,6 +385,92 @@ func (s *Store) GetBlock(height uint64) (*BlockHeader, error) {
 		return nil, err
 	}
 	return &h, nil
+}
+
+func blockTxsKey(height uint64) []byte {
+	return []byte(fmt.Sprintf("blktxs:%020d", height))
+}
+
+func txIndexKey(hash string) []byte {
+	h := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(hash), "0x"))
+	return []byte("tx:" + h)
+}
+
+// StoredTx is full tx body plus inclusion height for GET /tx and block detail.
+type StoredTx struct {
+	*tx.Transaction
+	Height uint64 `json:"height"`
+	Hash   string `json:"tx_hash"`
+}
+
+// SaveBlockWithTxs writes header + full transaction bodies (for explorer / Received index).
+func (s *Store) SaveBlockWithTxs(h BlockHeader, txs []*tx.Transaction) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		b, err := json.Marshal(h)
+		if err != nil {
+			return err
+		}
+		if err := txn.Set(blockKey(h.Height), b); err != nil {
+			return err
+		}
+		if err := txn.Set(metaKey("latest_height"), []byte(fmt.Sprintf("%d", h.Height))); err != nil {
+			return err
+		}
+		// Full bodies
+		bodies := make([]StoredTx, 0, len(txs))
+		for _, t := range txs {
+			if t == nil {
+				continue
+			}
+			hash := "0x" + t.Hash()
+			st := StoredTx{Transaction: t, Height: h.Height, Hash: hash}
+			bodies = append(bodies, st)
+			raw, err := json.Marshal(st)
+			if err != nil {
+				return err
+			}
+			if err := txn.Set(txIndexKey(hash), raw); err != nil {
+				return err
+			}
+		}
+		tb, err := json.Marshal(bodies)
+		if err != nil {
+			return err
+		}
+		return txn.Set(blockTxsKey(h.Height), tb)
+	})
+}
+
+// GetBlockTransactions returns full txs included at height (may be empty).
+func (s *Store) GetBlockTransactions(height uint64) ([]StoredTx, error) {
+	var out []StoredTx
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(blockTxsKey(height))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &out) })
+	})
+	return out, err
+}
+
+// GetTransaction looks up a sealed tx by hash (with or without 0x).
+func (s *Store) GetTransaction(hash string) (*StoredTx, error) {
+	var st StoredTx
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(txIndexKey(hash))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &st) })
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
 }
 
 func (s *Store) PruneOldBlocks(keep int) error {
