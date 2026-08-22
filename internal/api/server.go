@@ -43,8 +43,6 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/account/{address}/proof", s.handleAccountProof).Methods("GET")
 	r.HandleFunc("/block/latest", s.handleLatestBlock).Methods("GET")
 	r.HandleFunc("/block/{height}", s.handleGetBlock).Methods("GET")
-	r.HandleFunc("/tx/{hash}", s.handleGetTx).Methods("GET")
-	r.HandleFunc("/transaction/{hash}", s.handleGetTx).Methods("GET")
 	r.HandleFunc("/supply", s.handleSupply).Methods("GET")
 	r.HandleFunc("/supply/{bucket}", s.handleBucket).Methods("GET")
 
@@ -66,6 +64,8 @@ func New(cfg config.Config, store *state.Store, producer *consensus.Producer, p2
 	r.HandleFunc("/admin/seed", s.auth(s.handleSeed)).Methods("POST")
 	r.HandleFunc("/admin/prune", s.auth(s.handlePrune)).Methods("POST")
 	r.HandleFunc("/admin/backup", s.auth(s.handleBackup)).Methods("POST")
+	r.HandleFunc("/admin/snapshot", s.auth(s.handleGetSnapshot)).Methods("GET")
+	r.HandleFunc("/admin/snapshot", s.auth(s.handlePostSnapshot)).Methods("POST")
 	r.HandleFunc("/admin/restore-accounts", s.auth(s.handleRestoreAccounts)).Methods("POST")
 	r.HandleFunc("/admin/jail", s.handleListJailed).Methods("GET")
 	r.HandleFunc("/admin/unjail", s.auth(s.handleUnjail)).Methods("POST")
@@ -173,12 +173,7 @@ func (s *Server) handleLatestBlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	txs, _ := s.store.GetBlockTransactions(height)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"height": h.Height, "hash": h.Hash, "prev_hash": h.PrevHash, "state_root": h.StateRoot,
-		"tx_hashes": h.TxHashes, "timestamp": h.Timestamp, "proposer": h.Proposer,
-		"tx_count": h.TxCount, "signature": h.Signature, "transactions": txs,
-	})
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
@@ -192,34 +187,7 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "block not found", http.StatusNotFound)
 		return
 	}
-	txs, _ := s.store.GetBlockTransactions(height)
-	// Always return body so explorers never show EMPTY when tx_count > 0
-	writeJSON(w, http.StatusOK, map[string]any{
-		"height":     h.Height,
-		"hash":       h.Hash,
-		"prev_hash":  h.PrevHash,
-		"state_root": h.StateRoot,
-		"tx_hashes":  h.TxHashes,
-		"timestamp":  h.Timestamp,
-		"proposer":   h.Proposer,
-		"tx_count":   h.TxCount,
-		"signature":  h.Signature,
-		"transactions": txs, // full bodies when sealed with SaveBlockWithTxs
-	})
-}
-
-func (s *Server) handleGetTx(w http.ResponseWriter, r *http.Request) {
-	hash := mux.Vars(r)["hash"]
-	if hash == "" {
-		http.Error(w, "hash required", http.StatusBadRequest)
-		return
-	}
-	st, err := s.store.GetTransaction(hash)
-	if err != nil {
-		http.Error(w, "transaction not found", http.StatusNotFound)
-		return
-	}
-	writeJSON(w, http.StatusOK, st)
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (s *Server) handleSupply(w http.ResponseWriter, r *http.Request) {
@@ -581,6 +549,39 @@ func (s *Server) handleSetValidators(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+
+func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	maxBlocks := 2000
+	if v := r.URL.Query().Get("max_blocks"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxBlocks = n
+		}
+	}
+	snap, err := s.store.ExportSnapshot(maxBlocks)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *Server) handlePostSnapshot(w http.ResponseWriter, r *http.Request) {
+	var snap state.BackupSnapshot
+	if err := json.NewDecoder(r.Body).Decode(&snap); err != nil {
+		http.Error(w, "invalid snapshot json", http.StatusBadRequest)
+		return
+	}
+	force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+	acc, blocks, err := s.store.ImportFullSnapshot(&snap, force)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accounts_applied": acc, "blocks_applied": blocks, "tip": snap.LatestHeight,
+	})
+}
 
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 	path, err := s.store.ExportBackup(500)

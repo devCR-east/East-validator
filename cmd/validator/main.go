@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,7 +18,6 @@ import (
 	"github.com/eastchain/east-validator/internal/mempool"
 	"github.com/eastchain/east-validator/internal/p2p"
 	"github.com/eastchain/east-validator/internal/state"
-	chainsync "github.com/eastchain/east-validator/internal/sync"
 )
 
 func main() {
@@ -69,28 +67,13 @@ func main() {
 		log.Fatal().Err(err).Msg("genesis init failed")
 	}
 
-	// Optional header-only backfill from the legacy Neon/Vercel archive,
-	// so this node's chain is structurally continuous (prevHash matches)
-	// even for heights it never produced/received itself. Does not touch
-	// balances/stake — see internal/sync/archive.go's package comment.
-	if archiveBaseURL := os.Getenv("ARCHIVE_SYNC_URL"); archiveBaseURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		archiveSigner := os.Getenv("ARCHIVE_CHAIN_SIGNING_ADDRESS")
-		if targetHeight, err := chainsync.FetchArchiveHeight(ctx, archiveBaseURL); err != nil {
-			log.Warn().Err(err).Msg("archive sync: failed to fetch archive tip — continuing without backfill")
-		} else if err := chainsync.SyncFromArchive(ctx, store, archiveBaseURL, archiveSigner, uint64(targetHeight)); err != nil {
-			log.Warn().Err(err).Msg("archive sync failed — continuing with local state")
+	// Full state sync from seed (Paxi-inspired): accounts + recent headers + tip.
+	// Requires seed GET /admin/snapshot (not height-only archive sync).
+	if u := strings.TrimSpace(os.Getenv("STATE_SYNC_URL")); u != "" {
+		force := os.Getenv("STATE_SYNC_FORCE") == "true" || os.Getenv("STATE_SYNC_FORCE") == "1"
+		if err := state.SyncFromURL(store, u, os.Getenv("API_SECRET"), force); err != nil {
+			log.Warn().Err(err).Str("url", u).Msg("state-sync failed — continuing with local state")
 		}
-		cancel()
-	}
-
-	// Optional full state pull from primary (balances/stake/buckets).
-	if os.Getenv("STATE_SYNC_URL") != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		if err := chainsync.PullAndImportSnapshot(ctx, store); err != nil {
-			log.Warn().Err(err).Msg("state-sync failed — continuing with local state")
-		}
-		cancel()
 	}
 
 	// Local proposer identity
