@@ -3,8 +3,11 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -163,144 +166,119 @@ func (s *Store) RestoreAccountsFromSnapshot(path string, force bool) (int, error
 	return applied, nil
 }
 
-// BuildSnapshot builds an in-memory BackupSnapshot (same content as ExportBackup).
-func (s *Store) BuildSnapshot(maxBlocks int) (*BackupSnapshot, error) {
-	if maxBlocks <= 0 {
-		maxBlocks = 500
-	}
-	latest, err := s.GetLatestHeight()
+
+// ExportSnapshot builds an in-memory full-state snapshot (accounts + buckets +
+// recent headers + validator set). Used by GET /admin/snapshot and joiners.
+func (s *Store) ExportSnapshot(maxBlocks int) (*BackupSnapshot, error) {
+	path, err := s.ExportBackup(maxBlocks)
 	if err != nil {
 		return nil, err
 	}
-	vset, _ := s.GetValidatorSet()
-	jailed, _ := s.ListJailed(200)
-
-	accounts := make(map[string]Account)
-	var buckets []json.RawMessage
-	err = s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			key := string(it.Item().Key())
-			if len(key) > 4 && key[:4] == "acc:" {
-				var acc Account
-				if err := it.Item().Value(func(val []byte) error {
-					return json.Unmarshal(val, &acc)
-				}); err != nil {
-					return err
-				}
-				accounts[key[4:]] = acc
-			}
-			if len(key) > 7 && key[:7] == "bucket:" {
-				var raw []byte
-				if err := it.Item().Value(func(val []byte) error {
-					raw = append([]byte{}, val...)
-					return nil
-				}); err != nil {
-					return err
-				}
-				buckets = append(buckets, json.RawMessage(raw))
-			}
-		}
-		return nil
-	})
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
-	var blocks []BlockHeader
-	start := uint64(1)
-	if latest > uint64(maxBlocks) {
-		start = latest - uint64(maxBlocks) + 1
+	var snap BackupSnapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return nil, err
 	}
-	for h := start; h <= latest; h++ {
-		b, err := s.GetBlock(h)
-		if err != nil {
-			continue
-		}
-		blocks = append(blocks, *b)
-	}
-
-	return &BackupSnapshot{
-		Version:        1,
-		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
-		LatestHeight:   latest,
-		NumericChainID: s.numericChainID,
-		TotalMaxSupply: s.totalMaxSupply,
-		ValidatorSet:   vset,
-		Buckets:        buckets,
-		Accounts:       accounts,
-		RecentBlocks:   blocks,
-		Jailed:         jailed,
-	}, nil
+	return &snap, nil
 }
 
-// ImportSnapshot applies accounts (balance+stake+nonce), buckets, and optional
-// recent headers from a BackupSnapshot. force=true overwrites existing accounts.
-func (s *Store) ImportSnapshot(snap *BackupSnapshot, force bool) (accountsApplied int, err error) {
+// ImportFullSnapshot applies accounts + recent block headers + tip height.
+// force=true overwrites existing non-zero accounts (joiner catch-up).
+func (s *Store) ImportFullSnapshot(snap *BackupSnapshot, force bool) (accounts int, blocks int, err error) {
 	if snap == nil {
-		return 0, fmt.Errorf("nil snapshot")
+		return 0, 0, fmt.Errorf("nil snapshot")
 	}
+	if snap.NumericChainID != 0 && s.numericChainID != 0 && snap.NumericChainID != s.numericChainID {
+		return 0, 0, fmt.Errorf("chain id mismatch: snap=%d local=%d", snap.NumericChainID, s.numericChainID)
+	}
+
+	n, err := s.RestoreAccountsFromSnapshotBytes(snap, force)
+	if err != nil {
+		return 0, 0, err
+	}
+	accounts = n
+
+	for _, h := range snap.RecentBlocks {
+		if err := s.SaveBlock(h); err != nil {
+			log.Warn().Err(err).Uint64("height", h.Height).Msg("snapshot block import skip")
+			continue
+		}
+		blocks++
+	}
+	// Ensure tip matches snapshot even if some middle headers were missing
+	if snap.LatestHeight > 0 {
+		_ = s.db.Update(func(txn *badger.Txn) error {
+			return txn.Set(metaKey("latest_height"), []byte(fmt.Sprintf("%d", snap.LatestHeight)))
+		})
+	}
+	log.Info().
+		Int("accounts", accounts).
+		Int("blocks", blocks).
+		Uint64("tip", snap.LatestHeight).
+		Msg("full state snapshot imported")
+	return accounts, blocks, nil
+}
+
+// RestoreAccountsFromSnapshotBytes is like RestoreAccountsFromSnapshot but in-memory.
+func (s *Store) RestoreAccountsFromSnapshotBytes(snap *BackupSnapshot, force bool) (int, error) {
+	applied := 0
 	for addr, acc := range snap.Accounts {
 		cur, err := s.GetAccount(addr)
 		if err != nil {
-			return accountsApplied, err
+			return applied, err
 		}
 		if !force && (cur.Balance != 0 || cur.Staked != 0 || cur.Nonce != 0) {
 			continue
 		}
-		if err := s.db.Update(func(txn *badger.Txn) error {
+		_ = s.db.Update(func(txn *badger.Txn) error {
 			full := Account{
 				Balance:        acc.Balance,
 				Staked:         acc.Staked,
 				PendingUnstake: acc.PendingUnstake,
 				Nonce:          acc.Nonce,
 			}
-			val, err := json.Marshal(full)
-			if err != nil {
-				return err
-			}
+			val, _ := json.Marshal(full)
 			return txn.Set(accountKey(addr), val)
-		}); err != nil {
-			return accountsApplied, err
-		}
-		accountsApplied++
-	}
-
-	// Restore bucket mint counters (raw JSON as stored).
-	for _, raw := range snap.Buckets {
-		var b struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &b); err != nil || b.Name == "" {
-			continue
-		}
-		_ = s.db.Update(func(txn *badger.Txn) error {
-			return txn.Set(bucketKey(b.Name), []byte(raw))
 		})
+		applied++
 	}
-
-	// Fill missing headers only (do not fork tip if we already have a different hash).
-	for _, hdr := range snap.RecentBlocks {
-		if hdr.Height == 0 {
-			continue
-		}
-		if existing, err := s.GetBlock(hdr.Height); err == nil && existing != nil {
-			continue
-		}
-		_ = s.SaveBlock(hdr)
-	}
-
 	if snap.ValidatorSet != nil && len(snap.ValidatorSet.Addresses) > 0 {
 		_, _ = s.SaveValidatorSet(snap.ValidatorSet.Addresses)
 	}
+	return applied, nil
+}
 
-	log.Info().
-		Int("accounts", accountsApplied).
-		Uint64("snap_height", snap.LatestHeight).
-		Int("buckets", len(snap.Buckets)).
-		Int("headers", len(snap.RecentBlocks)).
-		Msg("snapshot imported")
-	return accountsApplied, nil
+// SyncFromURL downloads GET {base}/admin/snapshot and imports full state.
+func SyncFromURL(s *Store, baseURL, apiSecret string, force bool) error {
+	baseURL = strings.TrimRight(baseURL, "/")
+	url := baseURL + "/admin/snapshot?max_blocks=2000"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if apiSecret != "" {
+		req.Header.Set("X-API-Secret", apiSecret)
+	}
+	client := &http.Client{Timeout: 120 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("snapshot HTTP %d: %s", res.StatusCode, func() string { if len(body) < 200 { return string(body) }; return string(body[:200]) }())
+	}
+	var snap BackupSnapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		return err
+	}
+	_, _, err = s.ImportFullSnapshot(&snap, force)
+	return err
 }

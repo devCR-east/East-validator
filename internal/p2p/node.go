@@ -150,18 +150,15 @@ type Node struct {
 
 func LoadConfigFromEnv(nodeID string) Config {
 	enabled := os.Getenv("P2P_ENABLED") != "false"
-	port := 4001
+	// Default 26656 — port number familiar from Cosmos/CometBFT.
+	// Wire protocol remains libp2p (not CometBFT PEX).
+	port := 26656
 	if v := os.Getenv("P2P_PORT"); v != "" {
 		fmt.Sscanf(v, "%d", &port)
 	}
 	var bootstrap []string
 	if raw := os.Getenv("P2P_BOOTSTRAP"); raw != "" {
-		for _, p := range strings.Split(raw, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				bootstrap = append(bootstrap, p)
-			}
-		}
+		bootstrap = NormalizePeerAddrList(raw)
 	}
 	low, high := 50, 200
 	if v := os.Getenv("P2P_CONN_LOW"); v != "" {
@@ -184,8 +181,19 @@ func LoadConfigFromEnv(nodeID string) Config {
 		NodeID:        nodeID,
 		ConnLow:       low,
 		ConnHigh:      high,
-		AnnounceAddr:  strings.TrimSpace(os.Getenv("P2P_ANNOUNCE_ADDR")),
+		AnnounceAddr:  normalizeAnnounce(strings.TrimSpace(os.Getenv("P2P_ANNOUNCE_ADDR"))),
 	}
+}
+
+func normalizeAnnounce(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	n, err := NormalizePeerAddr(raw)
+	if err != nil {
+		return raw
+	}
+	return n
 }
 
 func New(cfg Config) (*Node, error) {
@@ -287,9 +295,13 @@ func New(cfg Config) (*Node, error) {
 	// Parse bootstrap multiaddrs → AddrInfo for DHT seeding.
 	var bootInfos []peer.AddrInfo
 	for _, raw := range cfg.Bootstrap {
+		norm, nerr := NormalizePeerAddr(raw)
+		if nerr == nil {
+			raw = norm
+		}
 		maddr, err := multiaddr.NewMultiaddr(raw)
 		if err != nil {
-			log.Warn().Str("addr", raw).Err(err).Msg("invalid bootstrap multiaddr")
+			log.Warn().Str("addr", raw).Err(err).Msg("invalid bootstrap multiaddr (use /dns4/.../p2p/ID or ID@host:26656)")
 			continue
 		}
 		info, err := peer.AddrInfoFromP2pAddr(maddr)
